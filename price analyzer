@@ -1,0 +1,388 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
+st.set_page_config(page_title="USDJPY RSI Signals + Vol", layout="wide")
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
+
+
+def download_fx_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, multi_level_index=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns=str.title)
+    return df.dropna().copy()
+
+
+def build_indicator(df: pd.DataFrame, rsi_period: int, fast_ma: int, slow_ma: int, trend_ma: int, vol_ma: int, fix_wicks: bool = False) -> pd.DataFrame:
+    data = df.copy()
+    data["RSI"] = rsi(data["Close"], rsi_period)
+    data["RSI_FAST"] = data["RSI"].rolling(fast_ma).mean()
+    data["RSI_SLOW"] = data["RSI"].rolling(slow_ma).mean()
+    data["TREND_MA"] = data["Close"].rolling(trend_ma).mean()
+    
+    # Volume calculation
+    # Forex volume on Yahoo is tick volume, but still useful for relative activity
+    if "Volume" not in data.columns or data["Volume"].sum() == 0:
+        # Fallback if no volume data: Simular volumen usando la volatilidad de la vela (High - Low)
+        # Esto nos permite tener un proxy de "actividad" para los pares de divisas
+        volatilidad = data["High"] - data["Low"]
+        # Escalarlo a números grandes para que se vea normal en la gráfica
+        data["Volume"] = volatilidad * 100000 
+    
+    if fix_wicks:
+        # Corrección del "efecto peine" (mechas largas) típico de datos FX en Yahoo Finance
+        body = (data["Close"] - data["Open"]).abs()
+        hl = data["High"] - data["Low"]
+        excess = (hl - body).clip(lower=0)
+        # Estimamos el spread constante que engorda las mechas 
+        spread_noise = excess.rolling(window=12, min_periods=1).median() * 0.8
+        
+        upper = data[["Open", "Close"]].max(axis=1)
+        lower = data[["Open", "Close"]].min(axis=1)
+        
+        # Reducimos las mechas asumiendo que el spread ensancha simétricamente el High y Low
+        data["High"] = np.maximum(data["High"] - spread_noise * 0.5, upper)
+        data["Low"] = np.minimum(data["Low"] + spread_noise * 0.5, lower)
+
+    data["VOL_MA"] = data["Volume"].rolling(vol_ma).mean()
+
+    buy_cross = (data["RSI_FAST"] > data["RSI_SLOW"]) & (data["RSI_FAST"].shift(1) <= data["RSI_SLOW"].shift(1))
+    sell_cross = (data["RSI_FAST"] < data["RSI_SLOW"]) & (data["RSI_FAST"].shift(1) >= data["RSI_SLOW"].shift(1))
+
+    trend_up = data["Close"] > data["TREND_MA"]
+    trend_down = data["Close"] < data["TREND_MA"]
+    
+    # Confirmación por volumen (volumen por encima de la media)
+    vol_confirm = data["Volume"] > data["VOL_MA"]
+
+    data["BUY_SIGNAL"] = buy_cross
+    data["SELL_SIGNAL"] = sell_cross
+    
+    # Señales de alta probabilidad
+    data["BUY_SIGNAL_HP"] = buy_cross & trend_up & vol_confirm
+    data["SELL_SIGNAL_HP"] = sell_cross & trend_down & vol_confirm
+
+    # Zonas de alta probabilidad (Tendencia + RSI Alineado + Volumen Confirmado)
+    data["ZONE_BUY"] = trend_up & (data["RSI_FAST"] > data["RSI_SLOW"]) & vol_confirm
+    data["ZONE_SELL"] = trend_down & (data["RSI_FAST"] < data["RSI_SLOW"]) & vol_confirm
+
+    data["CandleColor"] = np.where(data["Close"] >= data["Open"], "#8CFF4D", "#FF79D1")
+    return data.dropna().copy()
+
+
+def make_chart(data: pd.DataFrame, interval: str, show_labels: bool = True) -> go.Figure:
+    data = data.copy()
+    
+    # Transformar a strings para forzar un eje categórico y eliminar el 100% de huecos vacíos
+    if "d" in interval.lower() or "mo" in interval.lower() or "wk" in interval.lower():
+        fmt = "%d-%b<br>%Y"
+    else:
+        fmt = "%H:%M<br>%d-%b"
+    data.index = data.index.strftime(fmt)
+
+        
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        row_heights=[0.6, 0.2, 0.2],
+    )
+
+    # 1. Price candles
+    fig.add_trace(
+        go.Candlestick(
+            x=data.index,
+            open=data["Open"],
+            high=data["High"],
+            low=data["Low"],
+            close=data["Close"],
+            increasing_line_color="#8CFF4D",
+            increasing_fillcolor="#8CFF4D",
+            decreasing_line_color="#FF79D1",
+            decreasing_fillcolor="#FF79D1",
+            name="Precio",
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["TREND_MA"],
+            mode="lines",
+            line=dict(color="#FF4FC9", width=2),
+            name="Trend MA",
+        ),
+        row=1,
+        col=1,
+    )
+
+    # Signal Labels
+    buys = data[data["BUY_SIGNAL"]]
+    sells = data[data["SELL_SIGNAL"]]
+
+    if show_labels:
+        for idx, row in buys.iterrows():
+            hp_text = "⭐ " if row["BUY_SIGNAL_HP"] else ""
+            fig.add_annotation(
+                x=idx,
+                y=row["Low"],
+                text=f"{hp_text}Buy Signal: {row['Close']:.3f}",
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor="#39FF14",
+                arrowsize=1.5,
+                ax=0,
+                ay=30,
+                bgcolor="#39FF14" if row["BUY_SIGNAL_HP"] else "#005500",
+                bordercolor="#39FF14",
+                font=dict(color="black" if row["BUY_SIGNAL_HP"] else "white", size=11, family="Arial Black"),
+                borderpad=3,
+                row=1, col=1
+            )
+        for idx, row in sells.iterrows():
+            hp_text = "⭐ " if row["SELL_SIGNAL_HP"] else ""
+            fig.add_annotation(
+                x=idx,
+                y=row["High"],
+                text=f"{hp_text}Sell Signal: {row['Close']:.3f}",
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor="#FF1493",
+                arrowsize=1.5,
+                ax=0,
+                ay=-30,
+                bgcolor="#FF1493" if row["SELL_SIGNAL_HP"] else "#550033",
+                bordercolor="#FF1493",
+                font=dict(color="white", size=11, family="Arial Black"),
+                borderpad=3,
+                row=1, col=1
+            )
+
+    # Paint zones
+    def add_zones(condition, color):
+        blocks = []
+        start = None
+        for i, (idx, val) in enumerate(condition.items()):
+            if val and start is None:
+                start = idx
+            elif not val and start is not None:
+                blocks.append((start, data.index[i-1]))
+                start = None
+        if start is not None:
+            blocks.append((start, data.index[-1]))
+             
+        for s, e in blocks:
+            fig.add_vrect(x0=s, x1=e, fillcolor=color, opacity=0.15, layer="below", line_width=0, row=1, col=1)
+
+    add_zones(data["ZONE_BUY"], "#39FF14")  # Green zone
+    add_zones(data["ZONE_SELL"], "#FF1493") # Pink zone
+
+
+    # 2. RSI panel sin relleno
+    fig.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["RSI_FAST"] - 50,
+            mode="lines",
+            line=dict(color="#39FF14", width=2),
+            name="RSI Fast",
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["RSI_SLOW"] - 50,
+            mode="lines",
+            line=dict(color="#FF4FC9", width=2),
+            name="RSI Slow",
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.add_hline(y=0, line_width=1, line_color="white", opacity=0.6, row=2, col=1)
+
+    # 3. Volume Panel
+    fig.add_trace(
+        go.Bar(
+            x=data.index,
+            y=data["Volume"],
+            marker_color=data["CandleColor"],
+            name="Volume",
+        ),
+        row=3,
+        col=1,
+    )
+    
+    fig.add_trace(
+        go.Scatter(
+            x=data.index,
+            y=data["VOL_MA"],
+            mode="lines",
+            line=dict(color="rgba(0, 0, 0, 0.7)", width=2),
+            name="Vol MA",
+        ),
+        row=3,
+        col=1,
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=950,
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=20, r=20, t=30, b=20),
+    )
+    
+    # Configurar el eje principal (row=1) como categórico y calcular espaciado de etiquetas
+    num_ticks = 8
+    step = max(len(data) // num_ticks, 1)
+    
+    fig.update_xaxes(
+        showticklabels=True,
+        tickmode="linear",
+        dtick=step,
+        tickangle=0,
+        type="category",
+        row=1, col=1
+    )
+    # Hacer categóricos ocultando etiquetas para las filas inferiores
+    fig.update_xaxes(showticklabels=False, type="category", row=2, col=1)
+    fig.update_xaxes(showticklabels=False, type="category", row=3, col=1)
+
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="RSI osc", row=2, col=1)
+    fig.update_yaxes(title_text="Volume", row=3, col=1)
+    return fig
+
+
+# -----------------------------
+# UI
+# -----------------------------
+if st_autorefresh:
+    st_autorefresh(interval=15 * 1000, key="dataframerefresh")
+st.title("Señales RSI + Tendencia + Volumen")
+st.caption("Versión 2: Detecta cruces de RSI confirmados por el volumen de Tick y pinta zonas de Alta Probabilidad.")
+
+with st.sidebar:
+    st.header("Configuración")
+    
+    opciones = ["JPY=X", "AUDCHF=X", "GC=F", "DX-Y.NYB", "EURUSD=X", "GBPUSD=X", "US10Y", "Otro..."]
+    sel = st.selectbox("Símbolo Yahoo Finance", opciones, index=0)
+    if sel == "Otro...":
+        symbol = st.text_input("Escribe el símbolo exacto de Yahoo", value="JPY=X")
+    else:
+        symbol = sel
+        
+    period = st.selectbox("Periodo", ["5d", "1mo", "3mo", "6mo", "1y"], index=1)
+    interval = st.selectbox("Intervalo", ["5m", "15m", "30m", "1h"], index=0)
+
+    st.subheader("Parámetros del indicador")
+    rsi_period = st.slider("RSI period", 5, 30, 14)
+    fast_ma = st.slider("Suavizado rápido RSI", 2, 10, 3)
+    slow_ma = st.slider("Suavizado lento RSI", 4, 20, 7)
+    trend_ma = st.slider("Media de tendencia precio", 10, 100, 34)
+    vol_ma = st.slider("Media de Volumen", 5, 100, 20)
+    
+    show_labels = st.checkbox("Mostrar etiquetas BUY/SELL", value=True)
+    is_audchf = (symbol == "AUDCHF=X")
+    fix_wicks = st.checkbox("Filtrar mechas largas (Solución datos Yahoo)", value=is_audchf, help="Reduce las mechas exageradas en pares como AUDCHF debido a fluctuaciones del spread bid/ask en Yahoo Finance.")
+
+    st.markdown("---")
+    st.write("Valores sugeridos para USDJPY M5:")
+    st.code("RSI=14 | Fast=3 | Slow=7 | Trend=34 | Vol=20")
+
+
+try:
+    raw = download_fx_data(symbol, period, interval)
+    if raw.empty:
+        st.error("No se pudieron descargar datos. Prueba otro periodo o intervalo.")
+        st.stop()
+
+    data = build_indicator(raw, rsi_period, fast_ma, slow_ma, trend_ma, vol_ma, fix_wicks)
+    if data.empty:
+        st.error("No hay suficientes datos tras calcular el indicador.")
+        st.stop()
+
+    last = data.iloc[-1]
+    prev = data.iloc[-2] if len(data) > 1 else last
+
+    if last["BUY_SIGNAL_HP"]:
+        signal_txt = "BUY ALTA PROB ⭐"
+    elif last["SELL_SIGNAL_HP"]:
+        signal_txt = "SELL ALTA PROB ⭐"
+    elif last["BUY_SIGNAL"]:
+        signal_txt = "BUY (Bajo Vol)"
+    elif last["SELL_SIGNAL"]:
+        signal_txt = "SELL (Bajo Vol)"
+    elif last["RSI_FAST"] > last["RSI_SLOW"]:
+        signal_txt = "Momentum alcista"
+    else:
+        signal_txt = "Momentum bajista"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Precio actual", f"{last['Close']:.3f}", f"{last['Close'] - prev['Close']:.3f}")
+    c2.metric("RSI", f"{last['RSI']:.2f}")
+    c3.metric("Volumen", f"{last['Volume']:,.0f}", f"{last['Volume'] - prev['Volume']:,.0f}")
+    c4.metric("Estado", signal_txt)
+
+    fig = make_chart(data.tail(250), interval, show_labels=show_labels)
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("Últimas señales"):
+        signals = data.loc[data["BUY_SIGNAL"] | data["SELL_SIGNAL"]].copy()
+        signals["Signal"] = np.where(
+            signals["BUY_SIGNAL_HP"], "BUY ⭐", 
+            np.where(signals["SELL_SIGNAL_HP"], "SELL ⭐", 
+            np.where(signals["BUY_SIGNAL"], "BUY", "SELL"))
+        )
+        display_cols = ["Signal", "Close", "RSI", "Volume"]
+        signals = signals[display_cols].tail(20).sort_index(ascending=False)
+        st.dataframe(signals, use_container_width=True)
+
+    with st.expander("Cómo usarlo"):
+        st.markdown(
+            """
+            **Misma lógica fundamental más Confirmación de Volumen:**
+            - **BUY ⭐** alta probabilidad: RSI rápido cruza arriba, Tendencia Alcista y Volumen supera su Media Móvil.
+            - **SELL ⭐** alta probabilidad: RSI rápido cruza abajo, Tendencia Bajista y Volumen supera su Media Móvil.
+            - **Zonas Sombreadas**: El fondo del gráfico se pinta de verde o fucsia tenue cuando hay condiciones de alta probabilidad activas (Tendencia a favor, RSI a favor + Alta participación de volumen).
+            """
+        )
+
+except Exception as e:
+    st.error(f"Error al ejecutar la app: {e}")
+    st.info("Instala dependencias: streamlit, yfinance, pandas, numpy, plotly")
