@@ -1,0 +1,1 @@
+# Analisis_SMA_RSI
